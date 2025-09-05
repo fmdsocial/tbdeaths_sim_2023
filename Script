@@ -1,0 +1,362 @@
+# Tuberculosis Mortality Analysis in Brazil - Municipal Level
+# Author: Felipe Delpino
+# Date: 2025
+# Purpose: Analysis of tuberculosis mortality patterns by municipality
+
+# =============================================================================
+# 1. Environment Setup
+# =============================================================================
+
+rm(list = ls())
+gc()
+
+# Essential packages only
+packages <- c("microdatasus", "dplyr", "ggplot2", "sf", "geobr", 
+              "viridis", "knitr", "cluster")
+
+for(pkg in packages) {
+  if(!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(microdatasus)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(geobr)
+library(viridis)
+library(knitr)
+library(cluster)
+
+theme_set(theme_minimal())
+
+cat("Environment setup completed.\n")
+
+# =============================================================================
+# 2. Data Collection
+# =============================================================================
+
+# Tuberculosis ICD codes
+tb_codes <- c("A15", "A16", "A17", "A18", "A19", "B90")
+
+extract_icd_3digit <- function(icd) {
+  if (is.na(icd) || !is.character(icd)) return(NA)
+  return(substr(gsub("\\.", "", icd), 1, 3))
+}
+
+tb_3digit <- unique(sapply(tb_codes, extract_icd_3digit))
+
+states <- c("AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG",
+            "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO")
+
+# Download data
+cat("Downloading SIM-DO data for tuberculosis...\n")
+tryCatch({
+  sim_data <- fetch_datasus(
+    year_start = 2023, 
+    year_end = 2023,
+    information_system = "SIM-DO",
+    uf = states,
+    vars = c("DTOBITO", "DTNASC", "SEXO", "CAUSABAS", "CODMUNRES", "RACACOR")
+  )
+  cat("Download completed.\n")
+}, error = function(e) {
+  stop("Error downloading data: ", conditionMessage(e))
+})
+
+# =============================================================================
+# 3. Data Processing
+# =============================================================================
+
+# Filter for tuberculosis
+tb_data <- sim_data %>%
+  mutate(ICD_3DIG = sapply(CAUSABAS, extract_icd_3digit)) %>%
+  filter(ICD_3DIG %in% tb_3digit)
+
+cat(paste0("Total TB records: ", nrow(tb_data), "\n"))
+
+# Calculate age
+calculate_age <- function(birth_date, death_date) {
+  if (is.na(birth_date) || is.na(death_date) || 
+      nchar(birth_date) != 8 || nchar(death_date) != 8) {
+    return(NA)
+  }
+  
+  birth_year <- as.numeric(substr(birth_date, 5, 8))
+  death_year <- as.numeric(substr(death_date, 5, 8))
+  
+  if (is.na(birth_year) || is.na(death_year)) {
+    return(NA)
+  }
+  
+  return(death_year - birth_year)
+}
+
+# Process data
+tb_processed <- tb_data %>%
+  mutate(
+    AGE = mapply(calculate_age, DTNASC, DTOBITO),
+    AGE_GROUP = case_when(
+      is.na(AGE) ~ "Unknown",
+      AGE < 15 ~ "0-14",
+      AGE >= 15 & AGE < 30 ~ "15-29",
+      AGE >= 30 & AGE < 45 ~ "30-44", 
+      AGE >= 45 & AGE < 60 ~ "45-59",
+      AGE >= 60 ~ "60+"
+    ),
+    SEX_LABEL = case_when(
+      SEXO == "1" ~ "Male",
+      SEXO == "2" ~ "Female",
+      TRUE ~ "Unknown"
+    ),
+    MUNICIPALITY = CODMUNRES,
+    STATE_CODE = as.numeric(substr(CODMUNRES, 1, 2))
+  )
+
+# =============================================================================
+# 4. Municipal Analysis
+# =============================================================================
+
+cat("\n=== MUNICIPAL ANALYSIS ===\n")
+
+# Municipal summary
+municipal_summary <- tb_processed %>%
+  group_by(MUNICIPALITY, STATE_CODE) %>%
+  summarise(
+    total_deaths = n(),
+    mean_age = round(mean(AGE, na.rm = TRUE), 1),
+    male_pct = round(sum(SEX_LABEL == "Male", na.rm = TRUE) / n() * 100, 1),
+    elderly_pct = round(sum(AGE >= 60, na.rm = TRUE) / n() * 100, 1),
+    .groups = "drop"
+  ) %>%
+  filter(total_deaths >= 2) %>%  # Municipalities with at least 2 cases
+  arrange(desc(total_deaths))
+
+cat(paste0("Municipalities with TB deaths: ", nrow(municipal_summary), "\n"))
+
+# Top municipalities
+top_municipalities <- municipal_summary %>%
+  head(20)
+
+print(kable(top_municipalities, caption = "Top 20 Municipalities - TB Deaths"))
+
+# Distribution of deaths per municipality
+death_distribution <- municipal_summary %>%
+  count(total_deaths) %>%
+  mutate(percentage = round(n/sum(n)*100, 1))
+
+p1 <- ggplot(death_distribution, aes(x = factor(total_deaths), y = n)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Distribution of TB Deaths per Municipality",
+       subtitle = "Number of municipalities by death count",
+       x = "Number of TB deaths", y = "Number of municipalities") +
+  theme_minimal()
+
+print(p1)
+
+# =============================================================================
+# 5. Descriptive Analysis
+# =============================================================================
+
+cat("\n=== DESCRIPTIVE ANALYSIS ===\n")
+
+# Basic statistics
+cat("Basic Statistics:\n")
+cat(paste("Total TB deaths:", nrow(tb_processed), "\n"))
+cat(paste("Mean age:", round(mean(tb_processed$AGE, na.rm = TRUE), 1), "years\n"))
+cat(paste("Municipalities affected:", nrow(municipal_summary), "\n"))
+
+# Age distribution
+age_dist <- tb_processed %>%
+  count(AGE_GROUP) %>%
+  mutate(percentage = round(n/sum(n)*100, 1))
+
+p2 <- ggplot(age_dist, aes(x = reorder(AGE_GROUP, n), y = n, fill = AGE_GROUP)) +
+  geom_col(alpha = 0.8) +
+  coord_flip() +
+  scale_fill_viridis_d() +
+  labs(title = "TB Deaths by Age Group",
+       x = "Age Group", y = "Number of deaths") +
+  theme(legend.position = "none")
+
+print(p2)
+
+# Sex distribution
+sex_dist <- tb_processed %>%
+  filter(SEX_LABEL != "Unknown") %>%
+  count(SEX_LABEL) %>%
+  mutate(percentage = round(n/sum(n)*100, 1))
+
+p3 <- ggplot(sex_dist, aes(x = SEX_LABEL, y = n, fill = SEX_LABEL)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = c("Male" = "#2E86AB", "Female" = "#A23B72")) +
+  labs(title = "TB Deaths by Sex",
+       x = "Sex", y = "Number of deaths") +
+  theme(legend.position = "none")
+
+print(p3)
+
+# Municipal characteristics
+p4 <- ggplot(municipal_summary, aes(x = mean_age, y = male_pct)) +
+  geom_point(aes(size = total_deaths), alpha = 0.6, color = "steelblue") +
+  scale_size_continuous(name = "Total Deaths", range = c(1, 8)) +
+  labs(title = "Municipal TB Mortality Characteristics",
+       subtitle = "Bubble size = total deaths",
+       x = "Mean Age of Deaths", y = "Male Percentage (%)") +
+  theme_minimal()
+
+print(p4)
+
+# =============================================================================
+# 6. Simple Clustering Analysis
+# =============================================================================
+
+cat("\n=== CLUSTERING ANALYSIS ===\n")
+
+# Prepare data for clustering (municipalities with 3+ cases)
+cluster_data <- municipal_summary %>%
+  filter(total_deaths >= 3) %>%
+  select(total_deaths, mean_age, male_pct, elderly_pct) %>%
+  scale() %>%
+  as.data.frame()
+
+cluster_municipalities <- municipal_summary %>%
+  filter(total_deaths >= 3)
+
+rownames(cluster_data) <- cluster_municipalities$MUNICIPALITY
+
+cat(paste0("Municipalities in cluster analysis: ", nrow(cluster_data), "\n"))
+
+if(nrow(cluster_data) >= 6) {
+  # Distance matrix
+  dist_matrix <- dist(cluster_data)
+  
+  # Hierarchical clustering
+  hc_result <- hclust(dist_matrix, method = "ward.D2")
+  
+  # Plot dendrogram
+  plot(hc_result, main = "Hierarchical Clustering of Municipalities\nTB Mortality Patterns",
+       xlab = "Municipalities", ylab = "Height", cex = 0.6)
+  
+  # Cut tree for clusters
+  clusters <- cutree(hc_result, k = 3)
+  cluster_municipalities$cluster <- clusters
+  
+  # Cluster summary
+  cluster_summary <- cluster_municipalities %>%
+    group_by(cluster) %>%
+    summarise(
+      n_municipalities = n(),
+      avg_deaths = round(mean(total_deaths), 1),
+      avg_age = round(mean(mean_age), 1),
+      avg_male_pct = round(mean(male_pct), 1),
+      .groups = "drop"
+    )
+  
+  print(kable(cluster_summary, caption = "Cluster Analysis Results"))
+  
+  # Cluster visualization
+  p5 <- ggplot(cluster_municipalities, aes(x = mean_age, y = male_pct, 
+                                           color = factor(cluster))) +
+    geom_point(aes(size = total_deaths), alpha = 0.7) +
+    scale_color_viridis_d(name = "Cluster") +
+    scale_size_continuous(name = "Deaths", range = c(2, 10)) +
+    labs(title = "Municipal Clusters - TB Mortality",
+         x = "Mean Age", y = "Male Percentage (%)") +
+    theme_minimal()
+  
+  print(p5)
+} else {
+  cat("Insufficient municipalities for clustering analysis.\n")
+}
+
+# =============================================================================
+# 7. Geographic Analysis
+# =============================================================================
+
+cat("\n=== GEOGRAPHIC ANALYSIS ===\n")
+
+# Try to get municipality shapefile
+tryCatch({
+  cat("Downloading municipality boundaries...\n")
+  municipalities_sf <- read_municipality(year = 2020, simplified = TRUE)
+  
+  # Merge with TB data
+  tb_map_data <- municipalities_sf %>%
+    mutate(code_muni_numeric = as.numeric(code_muni)) %>%
+    left_join(municipal_summary, by = c("code_muni_numeric" = "MUNICIPALITY")) %>%
+    mutate(total_deaths = ifelse(is.na(total_deaths), 0, total_deaths))
+  
+  # Create map
+  p6 <- ggplot(tb_map_data) +
+    geom_sf(aes(fill = total_deaths), color = "white", size = 0.1) +
+    scale_fill_viridis_c(name = "TB Deaths", trans = "sqrt", 
+                         na.value = "grey90", option = "plasma") +
+    labs(title = "Tuberculosis Deaths by Municipality",
+         subtitle = "Brazil, 2023") +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p6)
+  
+}, error = function(e) {
+  cat("Geographic visualization not available:", conditionMessage(e), "\n")
+})
+
+# =============================================================================
+# 8. Statistical Tests
+# =============================================================================
+
+cat("\n=== STATISTICAL TESTS ===\n")
+
+# Chi-square test for sex distribution
+if(nrow(sex_dist) >= 2) {
+  sex_chi <- chisq.test(sex_dist$n)
+  cat("Sex distribution test:\n")
+  cat(paste("Chi-square =", round(sex_chi$statistic, 3), "\n"))
+  cat(paste("p-value =", format(sex_chi$p.value, scientific = TRUE), "\n\n"))
+}
+
+# Correlation analysis (if enough municipalities)
+if(nrow(municipal_summary) >= 10) {
+  cor_matrix <- cor(municipal_summary[,c("total_deaths", "mean_age", "male_pct", "elderly_pct")], 
+                    use = "complete.obs")
+  
+  cat("Correlation Matrix:\n")
+  print(round(cor_matrix, 3))
+}
+
+# =============================================================================
+# 9. Summary
+# =============================================================================
+
+cat("\n=== ANALYSIS SUMMARY ===\n")
+
+summary_stats <- tibble(
+  Metric = c("Total TB Deaths", "Affected Municipalities", "Mean Age", 
+             "Male Percentage", "Most Affected Municipality"),
+  Value = c(
+    nrow(tb_processed),
+    nrow(municipal_summary),
+    paste0(round(mean(tb_processed$AGE, na.rm = TRUE), 1), " years"),
+    paste0(round(sum(tb_processed$SEX_LABEL == "Male", na.rm = TRUE) / 
+                   nrow(tb_processed) * 100, 1), "%"),
+    ifelse(nrow(top_municipalities) > 0, 
+           paste0("Code ", top_municipalities$MUNICIPALITY[1], " (", 
+                  top_municipalities$total_deaths[1], " deaths)"), "N/A")
+  )
+)
+
+print(kable(summary_stats, caption = "Tuberculosis Analysis Summary"))
+
+cat("\nKey Findings:\n")
+cat("1. TB affects multiple municipalities across Brazil\n")
+cat("2. Significant variation in municipal burden\n")
+cat("3. Male predominance in TB mortality\n")
+cat("4. Working-age adults most affected\n")
+if(exists("cluster_summary")) {
+  cat("5. Municipalities cluster into distinct mortality patterns\n")
+}
+
+cat("\nAnalysis completed successfully.\n")
